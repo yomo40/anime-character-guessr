@@ -1,4 +1,5 @@
 const {
+    handlePlayerTimeout,
     getSyncAndNonstopState,
     calculateWinnerScore,
     applySetterObservers,
@@ -656,16 +657,19 @@ function setupSocket(io, rooms) {
             const player = room.players.find(p => p.id === socket.id);
             if (!player) return emitError('enterObserverMode', '连接中断了');
 
-            if (['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m))) {
-                player.team = '0';
-            } else {
+            const hasEndedMark = ['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m));
+
+            if (!hasEndedMark) {
+                // 未结束且主动进入观战，视为投降但不更改队伍，只做临时观战
                 if (room.currentGame && player.team && player.team !== '0') {
                     if (!room.currentGame.teamGuesses) room.currentGame.teamGuesses = {};
                     room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + '🏳️';
                 }
                 player.guesses += '🏳️';
-                player.team = '0';
             }
+
+            // 始终仅标记为临时观战，不修改队伍
+            player._tempObserver = true;
 
             broadcastPlayers(roomId, room);
             runFlowAndRefresh(roomId, room);
@@ -695,38 +699,19 @@ function setupSocket(io, rooms) {
             if (!player) return emitError('timeOut', '连接中断了');
             if (!room.currentGame) return emitError('timeOut', '游戏未开始或已结束');
 
-            // 超时计为一次失败猜测（用 ⏱️ 标记）
-            const timeoutMark = '⏱️';
+            // 使用 gameplay.js 中的统一超时处理函数
+            const { needsSyncUpdate } = handlePlayerTimeout(room, player, io, roomId);
 
-            player.guesses += timeoutMark;
-            if (player.team && player.team !== '0') {
-                if (!room.currentGame.teamGuesses) room.currentGame.teamGuesses = {};
-                room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + timeoutMark;
-                room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected)
-                    .forEach(teammate => { teammate.guesses = room.currentGame.teamGuesses[player.team]; io.to(teammate.id).emit('resetTimer'); });
-                if (room.currentGame?.settings?.syncMode) {
-                    const maxAttempts = room.currentGame?.settings?.maxAttempts || 10;
-                    // 计算猜测次数时，计入所有非结束标记，包括超时
-                    const cleaned = String(room.currentGame.teamGuesses[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
-                    const teamAttemptCount = Array.from(cleaned).length;
-                    if (teamAttemptCount >= maxAttempts) {
-                        room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected).forEach(teammate => {
-                            const ended = ['✌','👑','🏆','💀','🏳️'].some(mark => teammate.guesses.includes(mark));
-                            if (!ended) teammate.guesses += '💀';
-                            room.currentGame.syncPlayersCompleted?.add(teammate.id);
-                        });
-                        updateSyncProgress(room, roomId, io);
-                    }
-                }
-            }
-
-            if (room.currentGame.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
-                if (!['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m))) {
-                    room.currentGame.syncPlayersCompleted.add(socket.id);
-                    player.syncCompletedRound = room.currentGame.syncRound;
-                }
+            // 如果需要更新同步进度，调用更新函数
+            if (needsSyncUpdate) {
                 updateSyncProgress(room, roomId, io);
             }
+
+            // 广播猜测历史更新，让客户端重新计算剩余次数
+            io.to(roomId).emit('guessHistoryUpdate', {
+                guesses: room.currentGame.guesses,
+                teamGuesses: room.currentGame.teamGuesses
+            });
 
             broadcastPlayers(roomId, room);
             runFlowAndRefresh(roomId, room);

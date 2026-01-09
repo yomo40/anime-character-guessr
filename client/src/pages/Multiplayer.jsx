@@ -168,6 +168,33 @@ const Multiplayer = () => {
     // 用于追踪事件是否已经被处理
     const kickEventProcessed = {}; 
 
+    // 辅助函数：从玩家数据更新剩余次数和检查死亡状态
+    const updateGuessesLeftFromPlayer = (player) => {
+      if (!player || player.isAnswerSetter || player.team === '0') {
+        return;
+      }
+
+      // 直接从 player.guesses 字符串计算已使用的次数
+      const cleaned = String(player.guesses || '').replace(/[✌👑💀🏳️🏆]/g, '');
+      const used = Array.from(cleaned).length;
+      const max = gameSettingsRef.current?.maxAttempts || 10;
+      const left = Math.max(0, max - used);
+      setGuessesLeft(left);
+
+      // 检查是否包含死亡标记（💀）- 服务器已判定玩家死亡
+      const isDead = player.guesses.includes('💀');
+
+      if (isDead) {
+        // 已被服务器判死，进入旁观状态，避免重复触发结束逻辑
+        setIsObserver(true);
+      } else if (left <= 0) {
+        // 次数耗尽但服务器还未标记死亡，进入旁观模式
+        setTimeout(() => {
+          handleEnterObserverMode();
+        }, 100);
+      }
+    };
+
     // Socket event listeners
     newSocket.on('updatePlayers', ({ players, isPublic, answerSetterId }) => {
       setPlayers(players);
@@ -186,6 +213,9 @@ const Multiplayer = () => {
         if (me.team === '0') {
           setIsObserver(true);
         }
+
+        // 立即更新剩余次数并检查死亡状态
+        updateGuessesLeftFromPlayer(me);
       }
     });
 
@@ -452,44 +482,10 @@ const Multiplayer = () => {
     newSocket.on('guessHistoryUpdate', ({ guesses, teamGuesses }) => {
       setGuessesHistory(guesses);
 
-      // Sync guessesLeft from server history to prevent double deduction
+      // 使用统一的辅助函数更新剩余次数
       const currentPlayer = latestPlayersRef.current.find(p => p.id === newSocket.id);
-      if (currentPlayer && !currentPlayer.isAnswerSetter && currentPlayer.team !== '0') {
-        let used = 0;
-        if (teamGuesses && teamGuesses[currentPlayer.team]) {
-          const cleanedTeam = String(teamGuesses[currentPlayer.team]).replace(/[✌👑💀🏳️🏆]/g, '');
-          used = cleanedTeam.length;
-        } else {
-          const myHistory = guesses.find(g => g.username === currentPlayer.username);
-          if (myHistory) {
-            used = myHistory.guesses.length;
-          }
-        }
-        const max = gameSettingsRef.current?.maxAttempts || 10;
-        const left = Math.max(0, max - used);
-        setGuessesLeft(left);
-        
-        if (left <= 0) {
-          setTimeout(() => {
-            // 没有猜测次数后进入旁观模式
-            handleEnterObserverMode();
-          }, 100);
-        }
-      } else if (currentPlayer && !currentPlayer.isAnswerSetter && currentPlayer.team === null) {
-        const myHistory = guesses.find(g => g.username === currentPlayer.username);
-        if (myHistory) {
-          const used = myHistory.guesses.length;
-          const max = gameSettingsRef.current?.maxAttempts || 10;
-          const left = Math.max(0, max - used);
-          setGuessesLeft(left);
-          
-          if (left <= 0) {
-            setTimeout(() => {
-              // 没有猜测次数后进入旁观模式
-              handleEnterObserverMode();
-            }, 100);
-          }
-        }
+      if (currentPlayer) {
+        updateGuessesLeftFromPlayer(currentPlayer);
       }
     });
 
@@ -971,18 +967,9 @@ const Multiplayer = () => {
     if (timeUpRef.current || gameEnd || gameEndedRef.current) return;
     timeUpRef.current = true;
 
-    const newGuessesLeft = guessesLeft - 1;
-
-    setGuessesLeft(newGuessesLeft);
-
-    // Always emit timeout
+    // 发送超时事件到服务器，由服务器统一处理次数扣除和死亡判定
+    // 不在客户端手动减少 guessesLeft，避免与服务器状态不同步
     socketRef.current?.emit('timeOut', { roomId });
-
-    if (newGuessesLeft <= 0) {
-      setTimeout(() => {
-        handleGameEnd(false);
-      }, 100);
-    }
 
     setShouldResetTimer(true);
     setTimeout(() => {

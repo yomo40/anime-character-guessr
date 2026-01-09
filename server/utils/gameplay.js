@@ -1,4 +1,85 @@
 /**
+ * 处理玩家超时事件
+ * 标记超时、检查次数耗尽、判定死亡
+ * @param {Object} room - 房间对象
+ * @param {Object} player - 超时的玩家对象
+ * @param {Object} io - Socket.io 实例
+ * @param {string} roomId - 房间 ID
+ * @returns {Object} - { needsSyncUpdate: boolean, affectedPlayers: Array }
+ */
+function handlePlayerTimeout(room, player, io, roomId) {
+    if (!room?.currentGame || !player) {
+        return { needsSyncUpdate: false, affectedPlayers: [] };
+    }
+
+    const timeoutMark = '⏱️';
+    const maxAttempts = room.currentGame?.settings?.maxAttempts || 10;
+    const affectedPlayers = [];
+
+    // 添加超时标记
+    player.guesses += timeoutMark;
+    affectedPlayers.push(player);
+
+    // 队伍模式处理
+    if (player.team && player.team !== '0') {
+        if (!room.currentGame.teamGuesses) {
+            room.currentGame.teamGuesses = {};
+        }
+        room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + timeoutMark;
+        
+        // 同步队友的猜测记录
+        const teammates = room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected);
+        teammates.forEach(teammate => {
+            teammate.guesses = room.currentGame.teamGuesses[player.team];
+            affectedPlayers.push(teammate);
+            io.to(teammate.id).emit('resetTimer');
+        });
+        
+        // 计算队伍的有效猜测次数（不包含结束标记）
+        const cleaned = String(room.currentGame.teamGuesses[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
+        const teamAttemptCount = Array.from(cleaned).length;
+        
+        // 检查队伍次数是否耗尽
+        if (teamAttemptCount >= maxAttempts) {
+            teammates.forEach(teammate => {
+                const ended = ['✌','👑','🏆','💀','🏳️'].some(mark => teammate.guesses.includes(mark));
+                if (!ended) {
+                    teammate.guesses += '💀';
+                }
+                // 同步模式下标记完成
+                if (room.currentGame?.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
+                    room.currentGame.syncPlayersCompleted.add(teammate.id);
+                }
+            });
+        }
+    } else if (player.team === null) {
+        // 个人模式处理
+        const cleaned = String(player.guesses || '').replace(/[✌👑💀🏳️🏆]/g, '');
+        const personalAttemptCount = Array.from(cleaned).length;
+        
+        // 检查个人次数是否耗尽
+        if (personalAttemptCount >= maxAttempts) {
+            const ended = ['✌','👑','🏆','💀','🏳️'].some(mark => player.guesses.includes(mark));
+            if (!ended) {
+                player.guesses += '💀';
+            }
+        }
+    }
+
+    // 同步模式进度更新
+    let needsSyncUpdate = false;
+    if (room.currentGame.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
+        if (!['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m))) {
+            room.currentGame.syncPlayersCompleted.add(player.id);
+            player.syncCompletedRound = room.currentGame.syncRound;
+            needsSyncUpdate = true;
+        }
+    }
+
+    return { needsSyncUpdate, affectedPlayers };
+}
+
+/**
  * 获取同步模式和血战模式状态
  * @param {Object} room - 房间对象，包含 currentGame 和 players
  * @param {Function} emitCallback - 事件发送回调 (eventName, data) => void
@@ -1001,6 +1082,7 @@ function finalizeNonstopGame(room, roomId, io) {
 }
 
 module.exports = {
+    handlePlayerTimeout,
     getSyncAndNonstopState,
     calculateWinnerScore,
     calculateSetterScore,
