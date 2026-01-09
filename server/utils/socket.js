@@ -194,6 +194,13 @@ function setupSocket(io, rooms) {
             if (existingPlayerIndex !== -1) {
                 const existingPlayer = room.players[existingPlayerIndex];
                 if (existingPlayer.disconnected) {
+                    const normalizeAvatarId = (id) => (id === undefined || id === null) ? '' : String(id);
+                    const prevAvatarId = normalizeAvatarId(existingPlayer.avatarId);
+                    const incomingAvatarId = normalizeAvatarId(avatarId);
+                    if (prevAvatarId !== incomingAvatarId) {
+                        log.warn(`avatar mismatch for ${username} during reconnect: expected ${prevAvatarId || '<empty>'} got ${incomingAvatarId || '<empty>'}`);
+                        return emitError('joinRoom', '头像信息不一致，无法重连');
+                    }
                     const previousSocketId = existingPlayer.id;
                     existingPlayer.id = socket.id;
                     existingPlayer.disconnected = false;

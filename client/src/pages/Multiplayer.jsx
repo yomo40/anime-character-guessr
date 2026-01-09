@@ -105,8 +105,14 @@ const Multiplayer = () => {
   const [showCharacterPopup, setShowCharacterPopup] = useState(false);
   const [showSetAnswerPopup, setShowSetAnswerPopup] = useState(false);
   const [showFeedbackPopup, setShowFeedbackPopup] = useState(false);
-  const [isAnswerSetter, setIsAnswerSetter] = useState(false);
   const [kickNotification, setKickNotification] = useState(null);
+  const isSelfAnswerSetter = useMemo(() => {
+    const myId = socketRef.current?.id || socket?.id;
+    if (!myId) return false;
+    if (answerSetterId && answerSetterId === myId) return true;
+    const me = players.find(p => p.id === myId);
+    return !!me?.isAnswerSetter;
+  }, [answerSetterId, players, socket]);
   const [answerViewMode, setAnswerViewMode] = useState('simple'); // 'simple' or 'detailed'
   const [isGuessTableCollapsed, setIsGuessTableCollapsed] = useState(false); // 折叠猜测表格（只显示最新3个）
   const [waitingForSync, setWaitingForSync] = useState(false); // 同步模式：等待其他玩家
@@ -120,6 +126,10 @@ const Multiplayer = () => {
   const maxReconnectAttempts = 5;
   const reconnectTimerRef = useRef(null);
   const isManualDisconnectRef = useRef(false);
+  const allSpectators = useMemo(() => {
+    if (!players || players.length === 0) return false;
+    return players.every(p => p.disconnected || p.team === '0');
+  }, [players]);
 
   // 同步模式队列展示过滤：已完成且（断线/投降/猜对/队伍胜利）的不显示
   const getFilteredSyncStatus = () => {
@@ -168,12 +178,10 @@ const Multiplayer = () => {
       if (answerSetterId !== undefined) {
         setAnswerSetterId(answerSetterId);
       }
-      // Sync isHost, isAnswerSetter, and isObserver state from player list to ensure correctness
+      // Sync isHost state from player list to ensure correctness
       const me = players.find(p => p.id === newSocket.id);
       if (me) {
         setIsHost(me.isHost);
-        // Update isAnswerSetter flag based on current player status to prevent network lag spoilers
-        setIsAnswerSetter(me.isAnswerSetter || false);
         // 同时检查是否应该进入旁观模式（防止网络卡顿导致的状态不同步）
         if (me.team === '0') {
           setIsObserver(true);
@@ -343,7 +351,7 @@ const Multiplayer = () => {
       gameEndedRef.current = true;
     });
 
-    newSocket.on('gameStart', ({ character, settings, players, isPublic, hints = null, isAnswerSetter: isAnswerSetterFlag }) => {
+    newSocket.on('gameStart', ({ character, settings, players, isPublic, hints = null }) => {
       const decryptedCharacter = JSON.parse(CryptoJS.AES.decrypt(character, secret).toString(CryptoJS.enc.Utf8));
       decryptedCharacter.rawTags = new Map(decryptedCharacter.rawTags);
       setAnswerCharacter(decryptedCharacter);
@@ -377,7 +385,6 @@ const Multiplayer = () => {
         setGameEnd(false);
       }
       
-      setIsAnswerSetter(isAnswerSetterFlag);
       if (players) {
         setPlayers(players);
       }
@@ -826,7 +833,7 @@ const Multiplayer = () => {
     if (isGuessing || !answerCharacter || gameEnd) return;
 
     // 旁观者和出题人不能猜测
-    if (isObserver || isAnswerSetter) {
+    if (isObserver || isSelfAnswerSetter) {
       return;
     }
 
@@ -1001,6 +1008,12 @@ const Multiplayer = () => {
   const handleStartGame = async () => {
     // 防止重复点击：如果正在初始化游戏或游戏已开始，则返回
     if (isGameStarting || isGameStarted) return;
+
+    // 若全员为旁观者队伍，不允许开始
+    if (allSpectators) {
+      alert('至少需要一名非旁观者才能开始游戏');
+      return;
+    }
     
     if (isHost) {
       // 设置正在启动游戏的标志
@@ -1478,14 +1491,14 @@ const Multiplayer = () => {
                       <button
                         onClick={handleStartGame}
                         className="start-game-button"
-                        disabled={isGameStarting || players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || players.every(p => p.team === '0')}
+                        disabled={isGameStarting || players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || allSpectators}
                       >
                         {isGameStarting ? '正在启动...' : '开始'}
                       </button>
                       <button
                         onClick={handleManualMode}
                         className={`manual-mode-button ${isManualMode ? 'active' : ''}`}
-                        disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || players.every(p => p.team === '0')}
+                        disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || allSpectators}
                       >
                         有人想出题？
                       </button>
@@ -1508,7 +1521,7 @@ const Multiplayer = () => {
           {isGameStarted && !globalGameEnd && (
             // In game
             <div className="container">
-              {!isAnswerSetter && !isObserver ? (
+              {!isSelfAnswerSetter && !isObserver ? (
                 // Regular player view
                 <>
                   <SearchBar
@@ -1595,24 +1608,15 @@ const Multiplayer = () => {
                   />
                 </>
               ) : (
-                // Answer setter view or observer view
+                // Answer setter view
                 <div className="answer-setter-view">
-                  {/* Show selected answer for: answer setter, observers, and temp observers */}
-                  {(() => {
-                    const currentPlayer = players.find(p => p.id === socketRef.current?.id);
-                    const canSeeAnswer = isAnswerSetter || 
-                                         isObserver || 
-                                         currentPlayer?._tempObserver;
-                    return canSeeAnswer && answerCharacter ? (
-                      <div className="selected-answer">
-                        <Image src={answerCharacter.imageGrid} alt={answerCharacter.name} className="answer-image" />
-                        <div className="answer-info">
-                          <div>{answerCharacter.name}</div>
-                          <div>{answerCharacter.nameCn}</div>
-                        </div>
-                      </div>
-                    ) : null;
-                  })()}
+                  <div className="selected-answer">
+                    <Image src={answerCharacter.imageGrid} alt={answerCharacter.name} className="answer-image" />
+                    <div className="answer-info">
+                      <div>{answerCharacter.name}</div>
+                      <div>{answerCharacter.nameCn}</div>
+                    </div>
+                  </div>
                   {/* 血战模式进度显示（出题人视角）  */}
                   {gameSettings.nonstopMode && (
                     <div className="nonstop-progress-banner">
@@ -1655,14 +1659,14 @@ const Multiplayer = () => {
                       style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #ccc', background: answerViewMode === 'simple' ? '#e0e0e0' : '#fff', cursor: 'pointer', color: 'inherit' }}
                       onClick={() => setAnswerViewMode('simple')}
                     >
-                      {(isObserver && !isTeamObserver && !isAnswerSetter) ? '旁观' : '简单'}
+                      {(isObserver && !isTeamObserver && !isSelfAnswerSetter) ? '旁观' : '简单'}
                     </button>
                     <button
                       className={answerViewMode === 'detailed' ? 'active' : ''}
                       style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #ccc', background: answerViewMode === 'detailed' ? '#e0e0e0' : '#fff', cursor: 'pointer', color: 'inherit'}}
                       onClick={() => setAnswerViewMode('detailed')}
                     >
-                      {(isObserver && !isTeamObserver && !isAnswerSetter) ? '我的' : '详细'}
+                      {(isObserver && !isTeamObserver && !isSelfAnswerSetter) ? '我的' : '详细'}
                     </button>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '8px' }}>
                       <div 
@@ -1805,14 +1809,14 @@ const Multiplayer = () => {
                         <button
                           onClick={handleStartGame}
                           className="start-game-button"
-                          disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected)}
+                          disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || allSpectators}
                         >
                           开始
                         </button>
                         <button
                           onClick={handleManualMode}
                           className={`manual-mode-button ${isManualMode ? 'active' : ''}`}
-                          disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected)}
+                          disabled={players.length < 2 || players.some(p => !p.isHost && !p.ready && !p.disconnected) || allSpectators}
                         >
                           有人想出题？
                         </button>
@@ -1828,7 +1832,7 @@ const Multiplayer = () => {
                       <th className="game-end-header-cell">
                         <div className="game-end-header-content">
                           <div className="mode-tags">
-                            {!displaySettings.nonstopMode && !displaySettings.syncMode && (
+                            {!displaySettings.nonstopMode && !displaySettings.syncMode && !displaySettings.globalPick && !displaySettings.tagBan && (
                               <span className="mode-tag normal">普通模式</span>
                             )}
                             {displaySettings.nonstopMode && (
