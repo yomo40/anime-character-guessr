@@ -22,21 +22,22 @@ function handlePlayerTimeout(room, player, io, roomId) {
 
     // 队伍模式处理
     if (player.team && player.team !== '0') {
-        if (!room.currentGame.teamGuesses) {
+        if (room.currentGame && !room.currentGame.teamGuesses) {
             room.currentGame.teamGuesses = {};
         }
-        room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + timeoutMark;
-        
-        // 同步队友的猜测记录
-        const teammates = room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected);
-        teammates.forEach(teammate => {
-            teammate.guesses = room.currentGame.teamGuesses[player.team];
-            affectedPlayers.push(teammate);
-            io.to(teammate.id).emit('resetTimer');
-        });
+        if (room.currentGame && room.currentGame.teamGuesses) {
+            room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + timeoutMark;
+            
+            // 同步队友的猜测记录
+            const teammates = room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected);
+            teammates.forEach(teammate => {
+                teammate.guesses = room.currentGame.teamGuesses[player.team];
+                affectedPlayers.push(teammate);
+                io.to(teammate.id).emit('resetTimer');
+            });
         
         // 计算队伍的有效猜测次数（不包含结束标记）
-        const cleaned = String(room.currentGame.teamGuesses[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
+        const cleaned = String(room.currentGame?.teamGuesses?.[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
         const teamAttemptCount = Array.from(cleaned).length;
         
         // 检查队伍次数是否耗尽
@@ -47,7 +48,7 @@ function handlePlayerTimeout(room, player, io, roomId) {
                     teammate.guesses += '💀';
                 }
                 // 同步模式下标记完成
-                if (room.currentGame?.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
+                if (room.currentGame?.settings?.syncMode && room.currentGame?.syncPlayersCompleted) {
                     room.currentGame.syncPlayersCompleted.add(teammate.id);
                 }
             });
@@ -65,10 +66,11 @@ function handlePlayerTimeout(room, player, io, roomId) {
             }
         }
     }
+}
 
     // 同步模式进度更新
     let needsSyncUpdate = false;
-    if (room.currentGame.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
+    if (room.currentGame?.settings?.syncMode && room.currentGame?.syncPlayersCompleted) {
         if (!['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m))) {
             room.currentGame.syncPlayersCompleted.add(player.id);
             player.syncCompletedRound = room.currentGame.syncRound;
@@ -77,6 +79,31 @@ function handlePlayerTimeout(room, player, io, roomId) {
     }
 
     return { needsSyncUpdate, affectedPlayers };
+}
+
+const SYNC_WAITING_MIN_INTERVAL = 150; // ms，限制同步进度广播频率
+
+function buildSyncWaitingKey(round, syncStatus = []) {
+    const normalized = [...(syncStatus || [])]
+        .map(s => ({ id: String(s.id || ''), completed: !!s.completed }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+    return `r:${round}|${normalized.map(s => `${s.id}:${s.completed ? 1 : 0}`).join('|')}`;
+}
+
+function shouldSkipSyncWaiting(room, payload, { force = false } = {}) {
+    if (!room?.currentGame) return true;
+    const key = buildSyncWaitingKey(payload.round, payload.syncStatus);
+    const now = Date.now();
+    const lastKey = room.currentGame._lastSyncWaitingKey;
+    const lastAt = room.currentGame._lastSyncWaitingAt || 0;
+
+    if (!force && key === lastKey && now - lastAt < SYNC_WAITING_MIN_INTERVAL) {
+        return true;
+    }
+
+    room.currentGame._lastSyncWaitingKey = key;
+    room.currentGame._lastSyncWaitingAt = now;
+    return false;
 }
 
 /**
@@ -100,27 +127,30 @@ function getSyncAndNonstopState(room, emitCallback) {
         const syncStatus = syncPlayers.map(p => ({
             id: p.id,
             username: p.username,
-            completed: room.currentGame.syncPlayersCompleted ? room.currentGame.syncPlayersCompleted.has(p.id) : false
+            completed: room.currentGame?.syncPlayersCompleted ? room.currentGame.syncPlayersCompleted.has(p.id) : false
         }));
         
         if (emitCallback) {
-            emitCallback('syncWaiting', {
-                round: room.currentGame.syncRound,
+            const payload = {
+                round: room.currentGame?.syncRound,
                 syncStatus,
                 completedCount: syncStatus.filter(s => s.completed).length,
                 totalCount: syncStatus.length
-            });
+            };
+            if (!shouldSkipSyncWaiting(room, payload)) {
+                emitCallback('syncWaiting', payload);
+            }
 
-            if (room.currentGame.syncWinnerFound && !room.currentGame?.settings?.nonstopMode) {
+            if (room.currentGame?.syncWinnerFound && !room.currentGame?.settings?.nonstopMode) {
                 emitCallback('syncGameEnding', {
-                    winnerUsername: room.currentGame.syncWinner?.username,
-                    message: `${room.currentGame.syncWinner?.username} 已猜对！等待本轮结束...`
+                    winnerUsername: room.currentGame?.syncWinner?.username,
+                    message: `${room.currentGame?.syncWinner?.username} 已猜对！等待本轮结束...`
                 });
             }
         }
     }
 
-    if (room.currentGame.settings?.nonstopMode) {
+    if (room.currentGame?.settings?.nonstopMode) {
         const activePlayers = room.players.filter(p => !p.isAnswerSetter && p.team !== '0' && !p.disconnected);
         const remainingPlayers = activePlayers.filter(p => 
             !p.guesses.includes('✌') &&
@@ -132,7 +162,7 @@ function getSyncAndNonstopState(room, emitCallback) {
         
         if (emitCallback) {
             emitCallback('nonstopProgress', {
-                winners: (room.currentGame.nonstopWinners || []).map((w, idx) => ({ username: w.username, rank: idx + 1, score: w.score })),
+                winners: (room.currentGame?.nonstopWinners || []).map((w, idx) => ({ username: w.username, rank: idx + 1, score: w.score })),
                 remainingCount: remainingPlayers.length,
                 totalCount: activePlayers.length
             });
@@ -325,7 +355,6 @@ function applySetterObservers(room, roomId, setterId, io) {
         if (p.team === setter.team && p.id !== setterId && !p.isAnswerSetter && !p.disconnected) {
             // 只设置临时观战标记，不改变队伍
             p._tempObserver = true;
-            p.ready = false;
         }
     });
 
@@ -363,11 +392,11 @@ function revertSetterObservers(room, roomId, io) {
  */
 function markTeamVictory(room, roomId, player, io) {
     if (!room || !room.currentGame || !player) return;
-    if (room.currentGame) {
-        room.currentGame.teamGuesses = room.currentGame.teamGuesses || {};
+    if (room.currentGame && !room.currentGame.teamGuesses) {
+        room.currentGame.teamGuesses = {};
     }
     const teamId = player.team;
-    if (teamId && teamId !== '0') {
+    if (teamId && teamId !== '0' && room.currentGame?.teamGuesses) {
         if (!String(room.currentGame.teamGuesses[teamId] || '').includes('🏆')) {
             room.currentGame.teamGuesses[teamId] = (room.currentGame.teamGuesses[teamId] || '') + '🏆';
         }
@@ -494,12 +523,15 @@ function updateSyncProgress(room, roomId, io) {
                 pendingBanBroadcast = null;
             }
             room.currentGame.syncReadyToEnd = true;
-            io.to(roomId).emit('syncWaiting', {
+            const payload = {
                 round: room.currentGame.syncRound,
                 syncStatus,
                 completedCount: syncStatus.length,
                 totalCount: syncStatus.length
-            });
+            };
+            if (!shouldSkipSyncWaiting(room, payload)) {
+                io.to(roomId).emit('syncWaiting', payload);
+            }
             io.to(roomId).emit('syncGameEnding', {
                 winnerUsername: room.currentGame.syncWinner?.username,
                 message: `${room.currentGame.syncWinner?.username} 已猜对！等待本轮结束...`
@@ -511,6 +543,8 @@ function updateSyncProgress(room, roomId, io) {
         room.currentGame.syncReadyToEnd = false;
         room.currentGame.syncRound += 1;
         room.currentGame.syncPlayersCompleted.clear();
+        room.currentGame._lastSyncWaitingKey = null;
+        room.currentGame._lastSyncWaitingAt = 0;
         room.players.forEach(p => {
             if (typeof p.syncCompletedRound === 'number') {
                 delete p.syncCompletedRound;
@@ -538,19 +572,26 @@ function updateSyncProgress(room, roomId, io) {
             round: room.currentGame.syncRound
         });
 
-        io.to(roomId).emit('syncWaiting', {
+        const nextPayload = {
             round: room.currentGame.syncRound,
             syncStatus: nextSyncStatus,
             completedCount: nextSyncStatus.filter(s => s.completed).length,
             totalCount: nextSyncStatus.length
-        });
+        };
+        if (!shouldSkipSyncWaiting(room, nextPayload, { force: true })) {
+            io.to(roomId).emit('syncWaiting', nextPayload);
+        }
     } else {
-        io.to(roomId).emit('syncWaiting', {
+        const payload = {
             round: room.currentGame.syncRound,
             syncStatus,
             completedCount: syncStatus.filter(s => s.completed).length,
             totalCount: syncStatus.length
-        });
+        };
+
+        if (!shouldSkipSyncWaiting(room, payload)) {
+            io.to(roomId).emit('syncWaiting', payload);
+        }
 
         if (!room.currentGame?.settings?.nonstopMode && room.currentGame?.syncWinnerFound) {
             io.to(roomId).emit('syncGameEnding', {

@@ -97,10 +97,6 @@ const GameSettingsDisplay = ({
       label: '图片提示',
       value: settings.useImageHint || '无'
     },
-    includeGame: {
-      label: '包含游戏作品',
-      value: boolToText(settings.includeGame)
-    },
     timeLimit: {
       label: '时间限制',
       value: settings.timeLimit ? `${settings.timeLimit}秒` : '无限制'
@@ -125,10 +121,6 @@ const GameSettingsDisplay = ({
     subjectTagNum: {
       label: '作品标签数量',
       value: settings.subjectTagNum || '默认'
-    },
-    commonTags: {
-      label: '共同标签优先',
-      value: boolToText(settings.commonTags)
     },
     // 多人模式设置
     syncMode: {
@@ -156,7 +148,7 @@ const GameSettingsDisplay = ({
     '作品范围': ['yearRange', 'topNSubjects', 'useSubjectPerYear', 'metaTags'],
     '目录设置': ['useIndex', 'indexId'],
     '角色设置': ['mainCharacterOnly', 'characterNum', 'characterTagNum'],
-    '游戏规则': ['maxAttempts', 'useHints', 'timeLimit', 'subjectSearch', 'includeGame', 'subjectTagNum', 'commonTags']
+    '游戏规则': ['maxAttempts', 'useHints', 'timeLimit', 'subjectSearch', 'subjectTagNum']
   };
 
   const toggleExpand = () => {

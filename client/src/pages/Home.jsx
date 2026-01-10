@@ -1,12 +1,15 @@
 import { Link } from 'react-router-dom';
 import { useState, useEffect, useCallback } from 'react';
+import axios from '../utils/cached-axios';
 import '../styles/Home.css';
 import WelcomePopup from '../components/WelcomePopup';
 
 const LINE_OPTIONS = [
-  { url: 'https://anime-character-guessr.netlify.app/', name: 'Netlify' },
-  { url: 'https://ccb.baka.website/', name: 'Baka专线' }
+  { url: 'https://anime-character-guessr.netlify.app/', name: 'Netlify', apiBase: 'https://api.bgm.tv' },
+  { url: 'https://ccb.baka.website/', name: 'Baka专线', apiBase: 'https://bgmapi.baka.website' }
 ];
+
+const DEFAULT_API_BASE = import.meta.env.VITE_BGM_API_URL || 'https://api.bgm.tv';
 
 const Home = () => {
   const [roomCount, setRoomCount] = useState(0);
@@ -48,10 +51,20 @@ const Home = () => {
     setShowWelcomePopup(false);
   };
 
+  const generateRandomKeyword = () => {
+    const letters = 'abcdefghijklmnopqrstuvwxyz';
+    let result = '';
+    for (let i = 0; i < 4; i += 1) {
+      result += letters[Math.floor(Math.random() * letters.length)];
+    }
+    return result;
+  };
+
   const testLatency = useCallback(async () => {
     const links = document.querySelectorAll('.domain-link');
     for (const link of links) {
       const url = link.getAttribute('data-url');
+      const apiBase = link.getAttribute('data-api-base') || DEFAULT_API_BASE;
       const latencyText = link.querySelector('.latency-text');
       const indicator = link.querySelector('.status-indicator');
       const latencyDot = link.querySelector('.latency-dot');
@@ -59,24 +72,35 @@ const Home = () => {
       // 保持旧延迟显示直到新结果到达；仅添加半透明以提示正在刷新
       latencyText.classList.remove('text-green-600', 'text-yellow-600', 'text-red-600');
       latencyText.classList.add('opacity-50');
+
       const start = performance.now();
       let latency = -1;
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000);
-        await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: controller.signal });
+        const currentLimit = 1;
+        const currentOffset = 0;
+        const keyword = generateRandomKeyword();
+
+        await axios.post(
+          `${apiBase.replace(/\/$/, '')}/v0/search/characters?limit=${currentLimit}&offset=${currentOffset}`,
+          { keyword },
+          { signal: controller.signal }
+        );
         clearTimeout(timeoutId);
         const end = performance.now();
         latency = Math.round(end - start);
       } catch (e) {}
+
       latencyText.classList.remove('opacity-50');
       const isActive = link.classList.contains('active');
       if (latency >= 0) {
-        latencyText.textContent = `${latency}ms`;
-        // 决定颜色：绿/黄/红
+        const latencySeconds = latency / 1000;
+        latencyText.textContent = `${latencySeconds.toFixed(2)}s`;
+        // 决定颜色：绿/黄/红（阈值 0.5s / 2s）
         let color = '#ef4444';
-        if (latency < 100) color = '#22c55e';
-        else if (latency < 500) color = '#f59e0b';
+        if (latencySeconds < 0.5) color = '#22c55e';
+        else if (latencySeconds < 2) color = '#f59e0b';
 
         // 更新延迟文本颜色（仅影响文字颜色）
         latencyText.classList.remove('text-green-600', 'text-yellow-600', 'text-red-600');
@@ -141,7 +165,7 @@ const Home = () => {
       <div className="line-selector">
         <div className="line-selector-header">
           <span className="line-selector-title">线路选择</span>
-          <span className="line-selector-hint">如页面加载缓慢可尝试切换</span>
+          <span className="line-selector-hint">如搜索、猜测缓慢可尝试切换</span>
         </div>
         <div className="line-selector-list">
           {availableLines.map((line, idx) => {
@@ -149,6 +173,7 @@ const Home = () => {
             const cleanedOrigin = (currentOrigin || '').replace(/\/$/, '');
             const cleanedLine = line.url.replace(/\/$/, '');
             const isCurrent = cleanedOrigin && cleanedOrigin === cleanedLine;
+            const apiBase = line.apiBase || DEFAULT_API_BASE;
             // 判断是否为本地/局域网
             let displayName = line.name || line.url;
             if (idx === 2 || (!line.name && availableLines.length > 2 && idx === availableLines.length - 1)) {
@@ -184,6 +209,7 @@ const Home = () => {
                 key={`${line.url}-${idx}`}
                 className={`domain-link${isCurrent ? ' active' : ''}`}
                 data-url={line.url}
+                data-api-base={apiBase}
                 href={isCurrent ? '#' : line.url}
                 onClick={e => { if (isCurrent) e.preventDefault(); }}
                 style={{ pointerEvents: isCurrent ? 'none' : 'auto' }}

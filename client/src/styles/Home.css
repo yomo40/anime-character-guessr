@@ -197,7 +197,7 @@
   display: flex;
   flex-direction: column;
   width: 100%;
-  max-width: 210px;
+  max-width: 220px;
   transition: transform 0.3s ease;
 }
 

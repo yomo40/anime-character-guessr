@@ -95,7 +95,8 @@ const Multiplayer = () => {
   const [imgHint, setImgHint] = useState(null);
   const [shouldResetTimer, setShouldResetTimer] = useState(false);
   const [gameEnd, setGameEnd] = useState(false);
-  const timeUpRef = useRef(false);
+  const timeUpRef = useRef(0);
+  const lastTimeoutEmitRef = useRef(0);
   const gameEndedRef = useRef(false);
   const [scoreDetails, setScoreDetails] = useState(null);
   const [globalGameEnd, setGlobalGameEnd] = useState(false);
@@ -105,14 +106,11 @@ const Multiplayer = () => {
   const [showCharacterPopup, setShowCharacterPopup] = useState(false);
   const [showSetAnswerPopup, setShowSetAnswerPopup] = useState(false);
   const [showFeedbackPopup, setShowFeedbackPopup] = useState(false);
+  const [isAnswerSetter, setIsAnswerSetter] = useState(false);
+  // 是否允许在本局游戏中显示 selected-answer（答案卡片）。
+  // 该状态必须：每局开始时默认 false；仅在收到服务端“本客户端应显示答案”的信号后置为 true（出题人/旁观者/临时旁观者）；每局结束时重置。
+  const [canShowSelectedAnswer, setCanShowSelectedAnswer] = useState(false);
   const [kickNotification, setKickNotification] = useState(null);
-  const isSelfAnswerSetter = useMemo(() => {
-    const myId = socketRef.current?.id || socket?.id;
-    if (!myId) return false;
-    if (answerSetterId && answerSetterId === myId) return true;
-    const me = players.find(p => p.id === myId);
-    return !!me?.isAnswerSetter;
-  }, [answerSetterId, players, socket]);
   const [answerViewMode, setAnswerViewMode] = useState('simple'); // 'simple' or 'detailed'
   const [isGuessTableCollapsed, setIsGuessTableCollapsed] = useState(false); // 折叠猜测表格（只显示最新3个）
   const [waitingForSync, setWaitingForSync] = useState(false); // 同步模式：等待其他玩家
@@ -187,11 +185,8 @@ const Multiplayer = () => {
       if (isDead) {
         // 已被服务器判死，进入旁观状态，避免重复触发结束逻辑
         setIsObserver(true);
-      } else if (left <= 0) {
-        // 次数耗尽但服务器还未标记死亡，进入旁观模式
-        setTimeout(() => {
-          handleEnterObserverMode();
-        }, 100);
+        // 死亡后属于“临时旁观者”，允许看到答案卡片
+        setCanShowSelectedAnswer(true);
       }
     };
 
@@ -333,6 +328,9 @@ const Multiplayer = () => {
 
     newSocket.on('disconnect', (reason) => {
       console.log('[WebSocket] 连接断开:', reason);
+
+      // 断线期间不展示答案卡片，避免状态残留导致的短暂泄露
+      setCanShowSelectedAnswer(false);
       
       if (isManualDisconnectRef.current) {
         setConnectionStatus('disconnected');
@@ -381,7 +379,9 @@ const Multiplayer = () => {
       gameEndedRef.current = true;
     });
 
-    newSocket.on('gameStart', ({ character, settings, players, isPublic, hints = null }) => {
+    newSocket.on('gameStart', ({ character, settings, players, isPublic, hints = null, isAnswerSetter: isAnswerSetterFlag }) => {
+      // 每局开始先默认不显示答案卡片，避免网络卡顿/状态乱序导致短暂泄露
+      setCanShowSelectedAnswer(false);
       const decryptedCharacter = JSON.parse(CryptoJS.AES.decrypt(character, secret).toString(CryptoJS.enc.Utf8));
       decryptedCharacter.rawTags = new Map(decryptedCharacter.rawTags);
       setAnswerCharacter(decryptedCharacter);
@@ -391,12 +391,11 @@ const Multiplayer = () => {
       // Calculate guesses left based on current player's guess history
       const currentPlayer = players?.find(p => p.id === newSocket.id);
       const guessesMade = currentPlayer?.guesses?.length || 0;
-      const remainingGuesses = Math.max(0, settings.maxAttempts - guessesMade);
+      const remainingGuesses = Math.max(0, (settings?.maxAttempts ?? 10) - guessesMade);
       setGuessesLeft(remainingGuesses);
       
       // 检查当前玩家是否为旁观者
       const observerFlag = currentPlayer?.team === '0';
-      setIsObserver(observerFlag);
       
       // 检查当前玩家是否已经结束游戏（重连时恢复状态）
       const playerGuesses = currentPlayer?.guesses || '';
@@ -414,7 +413,14 @@ const Multiplayer = () => {
         gameEndedRef.current = false;
         setGameEnd(false);
       }
+
+      // 旁观者（team==='0'）与已结束玩家（临时旁观者：猜对/投降/死亡等）都应进入旁观视角
+      const effectiveObserver = !!observerFlag || !!hasGameEnded;
+      setIsObserver(effectiveObserver);
       
+      setIsAnswerSetter(isAnswerSetterFlag);
+      // 仅当服务端明确告知“本客户端应显示答案”（出题人/旁观者/临时旁观者）时才允许显示 selected-answer
+      setCanShowSelectedAnswer(!!isAnswerSetterFlag || effectiveObserver);
       if (players) {
         setPlayers(players);
       }
@@ -426,9 +432,9 @@ const Multiplayer = () => {
 
       // Prepare hints if enabled
       let hintTexts = [];
-      if (Array.isArray(settings.useHints) && settings.useHints.length > 0 && hints) {
+      if (Array.isArray(settings?.useHints) && settings.useHints.length > 0 && hints) {
         hintTexts = hints;
-      } else if (Array.isArray(settings.useHints) && settings.useHints.length > 0 && decryptedCharacter && decryptedCharacter.summary) {
+      } else if (Array.isArray(settings?.useHints) && settings.useHints.length > 0 && decryptedCharacter && decryptedCharacter.summary) {
         // Automatic mode - generate hints from summary
         const sentences = decryptedCharacter.summary.replace('[mask]', '').replace('[/mask]','')
           .split(/[。、，。！？ ""]/).filter(s => s.trim());
@@ -441,8 +447,8 @@ const Multiplayer = () => {
         }
       }
       setHints(hintTexts);
-      setUseImageHint(settings.useImageHint);
-      setImgHint(settings.useImageHint > 0 ? decryptedCharacter.image : null);
+      setUseImageHint(settings?.useImageHint ?? 0);
+      setImgHint((settings?.useImageHint ?? 0) > 0 ? decryptedCharacter.image : null);
       setGlobalGameEnd(false);
       setEndGameSettings(null); // 新局开始时清空上一局模式快照
       setScoreDetails(null);
@@ -542,6 +548,8 @@ const Multiplayer = () => {
       setIsGameStarted(false);
       setIsGameStarting(false); // 重置游戏启动标志，允许下一局开始
       setIsObserver(false); // 重置旁观者状态，下一局开始时会重新判断
+      setIsAnswerSetter(false);
+      setCanShowSelectedAnswer(false);
     });
 
     newSocket.on('resetReadyStatus', () => {
@@ -792,6 +800,8 @@ const Multiplayer = () => {
     // 猜中后进入旁观模式（isObserver=true），但不加入旁观队伍（team不变）
     if (isWin) {
       setIsObserver(true);
+      // 猜中后属于“临时旁观者”，允许看到答案卡片
+      setCanShowSelectedAnswer(true);
     }
 
     // 血战模式下，猜对不结束游戏，只发送 nonstopWin 事件
@@ -828,8 +838,8 @@ const Multiplayer = () => {
   const handleCharacterSelect = async (character) => {
     if (isGuessing || !answerCharacter || gameEnd) return;
 
-    // 旁观者和出题人不能猜测
-    if (isObserver || isSelfAnswerSetter) {
+    // 旁观者和出题人不能猜测（用 canShowSelectedAnswer 作为本局“出题人视角”的门闩，防止状态抖动）
+    if (isObserver || isAnswerSetter || canShowSelectedAnswer) {
       return;
     }
 
@@ -964,8 +974,20 @@ const Multiplayer = () => {
   };
 
   const handleTimeUp = () => {
-    if (timeUpRef.current || gameEnd || gameEndedRef.current) return;
-    timeUpRef.current = true;
+    if (timeUpRef.current >= 5 || gameEnd || gameEndedRef.current) return;
+
+    // 已结束/观战状态不再发送超时
+    const myId = socketRef.current?.id || socket?.id;
+    const me = latestPlayersRef.current.find(p => p?.id === myId);
+    const endedMarks = ['✌','👑','💀','🏳️','🏆'];
+    if (me && endedMarks.some(mark => (me.guesses || '').includes(mark))) return;
+
+    // 客户端侧防抖，避免网络卡顿导致短时间内多次触发
+    const now = Date.now();
+    if (now - lastTimeoutEmitRef.current < 1500) return;
+    lastTimeoutEmitRef.current = now;
+
+    timeUpRef.current += 1;
 
     // 发送超时事件到服务器，由服务器统一处理次数扣除和死亡判定
     // 不在客户端手动减少 guessesLeft，避免与服务器状态不同步
@@ -974,13 +996,15 @@ const Multiplayer = () => {
     setShouldResetTimer(true);
     setTimeout(() => {
       setShouldResetTimer(false);
-      timeUpRef.current = false;
+      timeUpRef.current = 0;
     }, 100);
   };
 
   const handleEnterObserverMode = () => {
     // 进入旁观模式（不结束游戏，允许其他玩家继续）
     setIsObserver(true);
+    // 进入旁观后允许看到答案卡片
+    setCanShowSelectedAnswer(true);
     socketRef.current?.emit('enterObserverMode', {
       roomId
     });
@@ -1508,7 +1532,7 @@ const Multiplayer = () => {
           {isGameStarted && !globalGameEnd && (
             // In game
             <div className="container">
-              {!isSelfAnswerSetter && !isObserver ? (
+              {!isAnswerSetter && !isObserver ? (
                 // Regular player view
                 <>
                   <SearchBar
@@ -1597,13 +1621,15 @@ const Multiplayer = () => {
               ) : (
                 // Answer setter view
                 <div className="answer-setter-view">
-                  <div className="selected-answer">
-                    <Image src={answerCharacter.imageGrid} alt={answerCharacter.name} className="answer-image" />
-                    <div className="answer-info">
-                      <div>{answerCharacter.name}</div>
-                      <div>{answerCharacter.nameCn}</div>
+                  {canShowSelectedAnswer && answerCharacter && (
+                    <div className="selected-answer">
+                      <Image src={answerCharacter.imageGrid} alt={answerCharacter.name} className="answer-image" />
+                      <div className="answer-info">
+                        <div>{answerCharacter.name}</div>
+                        <div>{answerCharacter.nameCn}</div>
+                      </div>
                     </div>
-                  </div>
+                  )}
                   {/* 血战模式进度显示（出题人视角）  */}
                   {gameSettings.nonstopMode && (
                     <div className="nonstop-progress-banner">
@@ -1646,14 +1672,14 @@ const Multiplayer = () => {
                       style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #ccc', background: answerViewMode === 'simple' ? '#e0e0e0' : '#fff', cursor: 'pointer', color: 'inherit' }}
                       onClick={() => setAnswerViewMode('simple')}
                     >
-                      {(isObserver && !isTeamObserver && !isSelfAnswerSetter) ? '旁观' : '简单'}
+                      {(isObserver && !isTeamObserver && !isAnswerSetter) ? '旁观' : '简单'}
                     </button>
                     <button
                       className={answerViewMode === 'detailed' ? 'active' : ''}
                       style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #ccc', background: answerViewMode === 'detailed' ? '#e0e0e0' : '#fff', cursor: 'pointer', color: 'inherit'}}
                       onClick={() => setAnswerViewMode('detailed')}
                     >
-                      {(isObserver && !isTeamObserver && !isSelfAnswerSetter) ? '我的' : '详细'}
+                      {(isObserver && !isTeamObserver && !isAnswerSetter) ? '我的' : '详细'}
                     </button>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '8px' }}>
                       <div 

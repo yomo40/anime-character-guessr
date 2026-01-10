@@ -39,13 +39,50 @@ function setupSocket(io, rooms) {
             return room;
         };
 
+        const PLAYER_BROADCAST_COOLDOWN = 120; // ms，合并短时间内的玩家列表广播
         const broadcastPlayers = (roomId, room, extra = {}) => {
-            io.to(roomId).emit('updatePlayers', {
+            if (!room) return;
+            const now = Date.now();
+            const forceImmediate = !!extra.forceImmediate;
+            const sanitizedExtra = { ...extra };
+            delete sanitizedExtra.forceImmediate;
+
+            const buildPayload = (extraPayload = {}) => ({
                 players: room.players,
                 isPublic: room.isPublic,
                 answerSetterId: room.answerSetterId,
-                ...extra
+                ...extraPayload
             });
+
+            const emitPayload = (payload) => {
+                room._lastPlayersBroadcastAt = Date.now();
+                room._pendingPlayerBroadcastExtra = null;
+                if (room._playerBroadcastTimer) {
+                    clearTimeout(room._playerBroadcastTimer);
+                    room._playerBroadcastTimer = null;
+                }
+                io.to(roomId).emit('updatePlayers', payload);
+            };
+
+            const mergedExtra = { ...(room._pendingPlayerBroadcastExtra || {}), ...sanitizedExtra };
+            const lastAt = room._lastPlayersBroadcastAt || 0;
+            const elapsed = now - lastAt;
+
+            if (forceImmediate || elapsed >= PLAYER_BROADCAST_COOLDOWN) {
+                emitPayload(buildPayload(mergedExtra));
+                return;
+            }
+
+            room._pendingPlayerBroadcastExtra = mergedExtra;
+            if (!room._playerBroadcastTimer) {
+                const delay = Math.max(10, PLAYER_BROADCAST_COOLDOWN - elapsed);
+                room._playerBroadcastTimer = setTimeout(() => {
+                    room._playerBroadcastTimer = null;
+                    const pendingExtra = room._pendingPlayerBroadcastExtra || {};
+                    room._pendingPlayerBroadcastExtra = null;
+                    emitPayload(buildPayload(pendingExtra));
+                }, delay);
+            }
         };
 
         /**
@@ -72,10 +109,10 @@ function setupSocket(io, rooms) {
             const isAnswerSetter = playerContext ? !!playerContext.isAnswerSetter : false;
             targetSocket.emit('gameStart', {
                 character: room.currentGame.character,
-                settings: room.currentGame.settings,
+                settings: room.currentGame?.settings,
                 players: room.players,
                 isPublic: room.isPublic,
-                hints: room.currentGame.hints || null,
+                hints: room.currentGame?.hints || null,
                 isAnswerSetter
             });
             if (room.currentGame) {
@@ -310,8 +347,18 @@ function setupSocket(io, rooms) {
          * @param {string} answerSetterId - 出题人的 socket ID
          */
         const initGameState = (room, character, settings, hints, answerSetterId) => {
-            // 计算初始的活跃玩家数（用于血战模式基础分计算，保持不变）
-            const initialActivePlayers = room.players.filter(p => !p.isAnswerSetter && p.team !== '0' && !p.disconnected).length;
+            // 计算初始的活跃玩家数（用于血战模式基础分计算）：仅统计“能猜测”的玩家
+            // - 排除出题人
+            // - 排除旁观者队伍（team==='0'）
+            // - 排除临时旁观（_tempObserver）
+            // - 排除断线玩家
+            const initialActivePlayers = room.players.filter(p => {
+                if (!p || p.disconnected) return false;
+                if (p.team === '0') return false;
+                if (p._tempObserver) return false;
+                if (answerSetterId && p.id === answerSetterId) return false;
+                return true;
+            }).length;
             
             room.currentGame = {
                 character,
@@ -329,7 +376,9 @@ function setupSocket(io, rooms) {
                 firstWinner: null,
                 tagBanState: [],
                 tagBanStatePending: [],
-                nonstopTotalPlayers: initialActivePlayers  // 记录初始玩家数，用于基础分计算
+                nonstopTotalPlayers: initialActivePlayers,  // 记录初始玩家数，用于基础分计算
+                _lastSyncWaitingKey: null,
+                _lastSyncWaitingAt: 0
             };
 
             room.players.forEach(p => {
@@ -406,7 +455,7 @@ function setupSocket(io, rooms) {
                 playerGuesses.guesses.push(entry);
                 room.players.forEach(target => {
                     if (target.id === socket.id || target.isAnswerSetter || target.team === '0' || target.team === player.team || target._tempObserver) {
-                        io.to(target.id).emit('guessHistoryUpdate', { guesses: room.currentGame.guesses, teamGuesses: room.currentGame.teamGuesses });
+                        io.to(target.id).emit('guessHistoryUpdate', { guesses: room.currentGame?.guesses, teamGuesses: room.currentGame?.teamGuesses });
                     }
                 });
             }
@@ -421,15 +470,17 @@ function setupSocket(io, rooms) {
 
             const mark = (!guessResult.isCorrect && guessResult.isPartialCorrect) ? '💡' : (guessResult.isCorrect ? '✔' : '❌');
             if (player.team && player.team !== '0') {
-                if (!room.currentGame.teamGuesses) room.currentGame.teamGuesses = {};
-                room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + mark;
-                room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected).forEach(teammate => {
-                    teammate.guesses = room.currentGame.teamGuesses[player.team];
-                });
+                if (room.currentGame && !room.currentGame.teamGuesses) room.currentGame.teamGuesses = {};
+                if (room.currentGame?.teamGuesses) {
+                    room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + mark;
+                    room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected).forEach(teammate => {
+                        teammate.guesses = room.currentGame.teamGuesses[player.team];
+                    });
+                }
 
                 if (room.currentGame?.settings?.syncMode) {
                     const maxAttempts = room.currentGame?.settings?.maxAttempts || 10;
-                    const cleanedTeam = String(room.currentGame.teamGuesses[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
+                    const cleanedTeam = String(room.currentGame?.teamGuesses?.[player.team] || '').replace(/[✌👑💀🏳️🏆]/g, '');
                     const teamAttemptCount = Array.from(cleanedTeam).length;
                     if (teamAttemptCount >= maxAttempts) {
                         room.players.filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected).forEach(teammate => {
@@ -444,7 +495,7 @@ function setupSocket(io, rooms) {
                 player.guesses += mark;
             }
 
-            if (room.currentGame.settings?.syncMode && room.currentGame.syncPlayersCompleted) {
+            if (room.currentGame?.settings?.syncMode && room.currentGame?.syncPlayersCompleted) {
                 if (!guessResult.isCorrect) {
                     room.currentGame.syncPlayersCompleted.add(socket.id);
                     if (player.team && player.team !== '0') {
@@ -458,7 +509,7 @@ function setupSocket(io, rooms) {
             if (!room.currentGame?.settings?.syncMode && !room.currentGame?.settings?.nonstopMode) {
                 const maxAttempts = room.currentGame?.settings?.maxAttempts || 10;
                 const countStr = player.team && player.team !== '0'
-                    ? room.currentGame.teamGuesses?.[player.team] || ''
+                    ? room.currentGame?.teamGuesses?.[player.team] || ''
                     : player.guesses;
                 const guessCount = Array.from(countStr.replace(/[✌👑💀🏳️🏆]/g, '')).length;
                 if (guessCount >= maxAttempts && !['💀','✌','👑','🏳️','🏆'].some(m => player.guesses.includes(m))) {
@@ -657,15 +708,38 @@ function setupSocket(io, rooms) {
             const player = room.players.find(p => p.id === socket.id);
             if (!player) return emitError('enterObserverMode', '连接中断了');
 
+            // 仅允许在游戏进行中进入观战；避免跨局/延迟事件污染当前局状态
+            if (!room.currentGame) return emitError('enterObserverMode', '游戏未开始或已结束');
+
             const hasEndedMark = ['✌','👑','💀','🏳️','🏆'].some(m => player.guesses.includes(m));
 
+            // 若已耗尽尝试次数，则应判定为死亡（💀），而不是投降（🏳️）。
+            // 这可以覆盖“最后一次猜测为同作品(💡)导致 left==0 后误触发 enterObserverMode”一类边界情况。
+            const maxAttempts = room.currentGame?.settings?.maxAttempts || 10;
+            const countSource = (player.team && player.team !== '0')
+                ? String(room.currentGame?.teamGuesses?.[player.team] || '')
+                : String(player.guesses || '');
+            const attemptCount = Array.from(countSource.replace(/[✌👑💀🏳️🏆]/g, '')).length;
+
             if (!hasEndedMark) {
-                // 未结束且主动进入观战，视为投降但不更改队伍，只做临时观战
-                if (room.currentGame && player.team && player.team !== '0') {
+                const endMark = attemptCount >= maxAttempts ? '💀' : '🏳️';
+
+                // 未结束且主动进入观战：默认视为投降（🏳️）
+                // 但若已耗尽次数（attemptCount>=maxAttempts），改为死亡（💀）
+                if (player.team && player.team !== '0') {
                     if (!room.currentGame.teamGuesses) room.currentGame.teamGuesses = {};
-                    room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + '🏳️';
+                    room.currentGame.teamGuesses[player.team] = (room.currentGame.teamGuesses[player.team] || '') + endMark;
+
+                    // 同步队友的 guesses（保持与 teamGuesses 一致）
+                    const updated = room.currentGame.teamGuesses[player.team];
+                    room.players
+                        .filter(p => p.team === player.team && !p.isAnswerSetter && !p.disconnected)
+                        .forEach(teammate => {
+                            teammate.guesses = updated;
+                        });
+                } else {
+                    player.guesses += endMark;
                 }
-                player.guesses += '🏳️';
             }
 
             // 始终仅标记为临时观战，不修改队伍
